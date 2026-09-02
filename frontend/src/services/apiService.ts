@@ -1,7 +1,7 @@
 import { Cow, RiskLevel, SensorTelemetry, SmsAlert } from "../types";
 import { MOCK_HERD_METADATA } from "../data/mockHerd";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "https://mastiguard-ecosystem.onrender.com";
+const API_BASE = "https://mastiguard-ecosystem.onrender.com";
 
 interface BackendCowRecord {
   cow_id: string;
