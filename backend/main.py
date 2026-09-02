@@ -168,7 +168,103 @@ def compute_derived_features(raw: Dict[str, float]) -> Dict[str, float]:
         "SCC_Log10": float(scc_log),
     }
 
-def ingest_telemetry_internal(payload: TelemetryPayload) -> Dict[str, Any]:
+def seed_initial_herd():
+    print("[*] Pre-populating 54 cows into memory store...")
+    for i in range(1, 55):
+        cow_id = f"COW_{i:03d}"
+        is_sample_risk = (i in [7, 14, 29])
+        is_sample_watch = (i in [3, 19, 42])
+
+        risk_level = "Mastitis Risk" if is_sample_risk else ("Watchlist" if is_sample_watch else "Healthy")
+        prob = 84.5 if is_sample_risk else (56.0 if is_sample_watch else 12.0)
+        temp = 39.6 if is_sample_risk else (39.1 if is_sample_watch else 38.5)
+        hardness = 2.5 if is_sample_risk else (1.0 if is_sample_watch else 0.0)
+        pain = 2.0 if is_sample_risk else 0.0
+        visibility = 1.0 if is_sample_risk else 0.0
+
+        raw_dict = {
+            "Months_after_giving_birth": float(2.0 + (i % 6)),
+            "Previous_Mastits_status": float(1.0 if (i % 5 == 0) else 0.0),
+            "IUFL": float(215.0 + (i % 10)),
+            "EUFL": float(245.0 if is_sample_risk else (230.0 + (i % 8))),
+            "IUFR": 218.0,
+            "EUFR": float(242.0 if is_sample_risk else 231.0),
+            "IURL": 220.0,
+            "EURL": 236.0,
+            "IURR": 222.0,
+            "EURR": 235.0,
+            "Temperature": float(temp),
+            "Hardness": float(hardness),
+            "Pain": float(pain),
+            "Milk_visibility": float(visibility),
+            "Rumination_Time_min": float(320.0 if is_sample_risk else (480.0 + (i % 50))),
+            "Eating_Time_min": float(240.0 if is_sample_risk else 370.0),
+            "Lying_Time_hr": float(13.5 if is_sample_risk else 11.5),
+            "Steps_Per_Day": float(1400.0 if is_sample_risk else 3200.0),
+            "SCC_K_cells_per_mL": float(450.0 if is_sample_risk else 80.0),
+            "Milk_Conductivity_mS": float(6.8 if is_sample_risk else 4.5),
+            "Milk_Yield_L": float(12.0 if is_sample_risk else 22.0)
+        }
+
+        derived_dict = compute_derived_features(raw_dict)
+
+        top_drivers = []
+        if is_sample_risk:
+            top_drivers = [
+                {"feature": "EUFL", "human_name": "Front-Left Quarter Udder Swelling", "value": 245.0, "shap_impact": 0.28, "is_danger": True},
+                {"feature": "Temperature", "human_name": "Core Body Temperature Elevation", "value": 39.6, "shap_impact": 0.22, "is_danger": True},
+                {"feature": "Pain_Index", "human_name": "Tissue Hardness, Pain & Secretion Score", "value": 5.5, "shap_impact": 0.18, "is_danger": True}
+            ]
+
+        herd_store[cow_id] = {
+            "cow_id": cow_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "risk_level": risk_level,
+            "mastitis_probability": prob,
+            "clinical_recommendation": "Isolate in quarantine pen, withhold automated milking, and verify with CMT." if is_sample_risk else ("Flag for close observation and verify electrical conductivity." if is_sample_watch else "Maintain standard milking cycle and hygiene protocol."),
+            "is_quarantined": is_sample_risk,
+            "raw_telemetry": raw_dict,
+            "derived_features": derived_dict,
+            "top_risk_drivers": top_drivers
+        }
+    print(f"[+] Initial seed completed: {len(herd_store)} cows ready in store.")
+
+# Populate store immediately upon module import
+seed_initial_herd()
+
+@app.on_event("startup")
+def startup_event():
+    global model, explainer, model_meta
+    print("[*] FastAPI Sentinel Engine starting up...")
+    if os.path.exists(MODEL_JSON_PATH):
+        model = XGBClassifier()
+        model.load_model(MODEL_JSON_PATH)
+        try:
+            explainer = shap.TreeExplainer(model)
+        except Exception as e:
+            print(f"[!] Warning initializing TreeExplainer: {e}")
+        print(f"[+] Loaded XGBoost model from {MODEL_JSON_PATH}")
+    else:
+        print(f"[!] Warning: Model file not found at {MODEL_JSON_PATH}")
+
+    if os.path.exists(META_JSON_PATH):
+        with open(META_JSON_PATH, "r", encoding="utf-8") as f:
+            model_meta = json.load(f)
+            print(f"[+] Loaded model metadata from {META_JSON_PATH}")
+
+@app.get("/")
+def root():
+    return {
+        "system": "MastiGuard AI (Aarogya) Sentinel Platform",
+        "status": "online",
+        "active_cattle_count": len(herd_store),
+        "model_loaded": model is not None,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.post("/api/v1/telemetry")
+def ingest_telemetry(payload: TelemetryPayload):
     if model is None:
         raise HTTPException(status_code=503, detail="XGBoost model not initialized")
 
@@ -253,80 +349,6 @@ def ingest_telemetry_internal(payload: TelemetryPayload) -> Dict[str, Any]:
 
     herd_store[payload.cow_id] = cow_record
     return cow_record
-
-@app.on_event("startup")
-def startup_event():
-    global model, explainer, model_meta
-    print("[*] FastAPI Sentinel Engine starting up...")
-    if os.path.exists(MODEL_JSON_PATH):
-        model = XGBClassifier()
-        model.load_model(MODEL_JSON_PATH)
-        try:
-            explainer = shap.TreeExplainer(model)
-        except Exception as e:
-            print(f"[!] Warning initializing TreeExplainer: {e}")
-        print(f"[+] Loaded XGBoost model from {MODEL_JSON_PATH}")
-    else:
-        print(f"[!] Warning: Model file not found at {MODEL_JSON_PATH}")
-
-    if os.path.exists(META_JSON_PATH):
-        with open(META_JSON_PATH, "r", encoding="utf-8") as f:
-            model_meta = json.load(f)
-            print(f"[+] Loaded model metadata from {META_JSON_PATH}")
-
-    # Seed 54 cows on boot
-    if len(herd_store) == 0 and model is not None:
-        print("[*] Pre-populating 54 cows into memory store...")
-        for i in range(1, 55):
-            cow_id = f"COW_{i:03d}"
-            is_sample_risk = (i in [7, 14, 29])
-            is_sample_watch = (i in [3, 19, 42])
-
-            temp = 39.6 if is_sample_risk else (39.1 if is_sample_watch else 38.5)
-            hardness = 2.5 if is_sample_risk else (1.0 if is_sample_watch else 0.0)
-            pain = 2.0 if is_sample_risk else 0.0
-            visibility = 1.0 if is_sample_risk else 0.0
-
-            telemetry_data = TelemetryPayload(
-                cow_id=cow_id,
-                Months_after_giving_birth=2.0 + (i % 6),
-                Previous_Mastits_status=1.0 if (i % 5 == 0) else 0.0,
-                IUFL=215.0 + (i % 10),
-                EUFL=245.0 if is_sample_risk else (230.0 + (i % 8)),
-                IUFR=218.0,
-                EUFR=242.0 if is_sample_risk else 231.0,
-                IURL=220.0,
-                EURL=236.0,
-                IURR=222.0,
-                EURR=235.0,
-                Temperature=temp,
-                Hardness=hardness,
-                Pain=pain,
-                Milk_visibility=visibility,
-                Rumination_Time_min=320.0 if is_sample_risk else (480.0 + (i % 50)),
-                Eating_Time_min=240.0 if is_sample_risk else 370.0,
-                Lying_Time_hr=13.5 if is_sample_risk else 11.5,
-                Steps_Per_Day=1400.0 if is_sample_risk else 3200.0,
-                SCC_K_cells_per_mL=450.0 if is_sample_risk else 80.0,
-                Milk_Conductivity_mS=6.8 if is_sample_risk else 4.5,
-                Milk_Yield_L=12.0 if is_sample_risk else 22.0
-            )
-            ingest_telemetry_internal(telemetry_data)
-        print(f"[+] Successfully seeded {len(herd_store)} cows.")
-
-@app.get("/")
-def root():
-    return {
-        "system": "MastiGuard AI (Aarogya) Sentinel Platform",
-        "status": "online",
-        "active_cattle_count": len(herd_store),
-        "model_loaded": model is not None,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
-
-@app.post("/api/v1/telemetry")
-def ingest_telemetry(payload: TelemetryPayload):
-    return ingest_telemetry_internal(payload)
 
 @app.get("/api/v1/cows")
 def get_all_cows():
