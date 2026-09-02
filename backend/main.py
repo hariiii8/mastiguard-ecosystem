@@ -116,7 +116,6 @@ class TelemetryPayload(BaseModel):
     Hardness: float = 0.0
     Pain: float = 0.0
     Milk_visibility: float = 0.0
-    # Behavioral / rumination features (v2)
     Rumination_Time_min: float = 500.0
     Eating_Time_min: float = 370.0
     Lying_Time_hr: float = 11.5
@@ -139,15 +138,14 @@ def compute_derived_features(raw: Dict[str, float]) -> Dict[str, float]:
     delta_rl = raw["EURL"] - raw["IURL"]
     delta_rr = raw["EURR"] - raw["IURR"]
 
-    contra_asym  = abs(delta_fl - delta_fr) + abs(delta_rl - delta_rr)
-    ap_asym      = abs(delta_fl - delta_rl) + abs(delta_fr - delta_rr)
+    contra_asym = abs(delta_fl - delta_fr) + abs(delta_rl - delta_rr)
+    ap_asym = abs(delta_fl - delta_rl) + abs(delta_fr - delta_rr)
     thermal_spike = max(0.0, raw["Temperature"] - 39.3)
-    pain_index   = raw["Hardness"] + raw["Pain"] + raw["Milk_visibility"]
+    pain_index = raw["Hardness"] + raw["Pain"] + raw["Milk_visibility"]
 
-    # Behavioral derived
-    rum   = raw.get("Rumination_Time_min", 500.0)
-    eat   = raw.get("Eating_Time_min", 370.0)
-    oral  = rum + eat if (rum + eat) > 0 else 1.0
+    rum = raw.get("Rumination_Time_min", 500.0)
+    eat = raw.get("Eating_Time_min", 370.0)
+    oral = rum + eat if (rum + eat) > 0 else 1.0
     rum_ratio = rum / oral
 
     steps = raw.get("Steps_Per_Day", 3000.0)
@@ -170,35 +168,7 @@ def compute_derived_features(raw: Dict[str, float]) -> Dict[str, float]:
         "SCC_Log10": float(scc_log),
     }
 
-@app.on_event("startup")
-def startup_event():
-    global model, explainer, model_meta
-    print("[*] FastAPI Sentinel Engine starting up...")
-    if os.path.exists(MODEL_JSON_PATH):
-        model = XGBClassifier()
-        model.load_model(MODEL_JSON_PATH)
-        explainer = shap.TreeExplainer(model)
-        print(f"[+] Loaded XGBoost model from {MODEL_JSON_PATH}")
-    else:
-        print(f"[!] Warning: Model file not found at {MODEL_JSON_PATH}")
-
-    if os.path.exists(META_JSON_PATH):
-        with open(META_JSON_PATH, "r", encoding="utf-8") as f:
-            model_meta = json.load(f)
-            print(f"[+] Loaded model metadata from {META_JSON_PATH}")
-
-@app.get("/")
-def root():
-    return {
-        "system": "MastiGuard AI (Aarogya) Sentinel Platform",
-        "status": "online",
-        "active_cattle_count": len(herd_store),
-        "model_loaded": model is not None,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
-
-@app.post("/api/v1/telemetry")
-def ingest_telemetry(payload: TelemetryPayload):
+def ingest_telemetry_internal(payload: TelemetryPayload) -> Dict[str, Any]:
     if model is None:
         raise HTTPException(status_code=503, detail="XGBoost model not initialized")
 
@@ -217,36 +187,42 @@ def ingest_telemetry(payload: TelemetryPayload):
         "Temperature": payload.Temperature,
         "Hardness": payload.Hardness,
         "Pain": payload.Pain,
-        "Milk_visibility": payload.Milk_visibility
+        "Milk_visibility": payload.Milk_visibility,
+        "Rumination_Time_min": payload.Rumination_Time_min,
+        "Eating_Time_min": payload.Eating_Time_min,
+        "Lying_Time_hr": payload.Lying_Time_hr,
+        "Steps_Per_Day": payload.Steps_Per_Day,
+        "SCC_K_cells_per_mL": payload.SCC_K_cells_per_mL,
+        "Milk_Conductivity_mS": payload.Milk_Conductivity_mS,
+        "Milk_Yield_L": payload.Milk_Yield_L,
     }
 
     derived_dict = compute_derived_features(raw_dict)
     full_vector_dict = {**raw_dict, **derived_dict}
     vector = np.array([[full_vector_dict[feat] for feat in ALL_FEATURES]], dtype=np.float32)
 
-    # Inference probability
     probs = model.predict_proba(vector)[0]
     prob_mastitis = float(probs[1])
 
-    # Local TreeSHAP risk drivers
     top_risk_drivers = []
     if explainer is not None:
-        shap_vals = explainer.shap_values(vector)[0]
-        # Rank by positive impact on mastitis risk
-        ranked_indices = np.argsort(shap_vals)[::-1]
-        for idx in ranked_indices[:3]:
-            feat_name = ALL_FEATURES[idx]
-            impact = float(shap_vals[idx])
-            val = float(vector[0, idx])
-            top_risk_drivers.append({
-                "feature": feat_name,
-                "human_name": FEATURE_HUMAN_NAMES.get(feat_name, feat_name),
-                "value": round(val, 2),
-                "shap_impact": round(impact, 4),
-                "is_danger": impact > 0.1
-            })
+        try:
+            shap_vals = explainer.shap_values(vector)[0]
+            ranked_indices = np.argsort(shap_vals)[::-1]
+            for idx in ranked_indices[:3]:
+                feat_name = ALL_FEATURES[idx]
+                impact = float(shap_vals[idx])
+                val = float(vector[0, idx])
+                top_risk_drivers.append({
+                    "feature": feat_name,
+                    "human_name": FEATURE_HUMAN_NAMES.get(feat_name, feat_name),
+                    "value": round(val, 2),
+                    "shap_impact": round(impact, 4),
+                    "is_danger": impact > 0.1
+                })
+        except Exception as e:
+            print(f"[!] SHAP calculation bypassed: {e}")
 
-    # Determine risk level
     if prob_mastitis < 0.35:
         risk_level = "Healthy"
         clinical_recommendation = "Maintain standard milking cycle and hygiene protocol."
@@ -257,7 +233,6 @@ def ingest_telemetry(payload: TelemetryPayload):
         risk_level = "Mastitis Risk"
         clinical_recommendation = "Isolate in quarantine pen, withhold automated milking, and verify with CMT."
 
-    # Preserve or update quarantine state
     prev_state = herd_store.get(payload.cow_id, {})
     is_quarantined = prev_state.get("is_quarantined", False)
     if risk_level == "Mastitis Risk" and not prev_state.get("user_unquarantined", False):
@@ -278,6 +253,80 @@ def ingest_telemetry(payload: TelemetryPayload):
 
     herd_store[payload.cow_id] = cow_record
     return cow_record
+
+@app.on_event("startup")
+def startup_event():
+    global model, explainer, model_meta
+    print("[*] FastAPI Sentinel Engine starting up...")
+    if os.path.exists(MODEL_JSON_PATH):
+        model = XGBClassifier()
+        model.load_model(MODEL_JSON_PATH)
+        try:
+            explainer = shap.TreeExplainer(model)
+        except Exception as e:
+            print(f"[!] Warning initializing TreeExplainer: {e}")
+        print(f"[+] Loaded XGBoost model from {MODEL_JSON_PATH}")
+    else:
+        print(f"[!] Warning: Model file not found at {MODEL_JSON_PATH}")
+
+    if os.path.exists(META_JSON_PATH):
+        with open(META_JSON_PATH, "r", encoding="utf-8") as f:
+            model_meta = json.load(f)
+            print(f"[+] Loaded model metadata from {META_JSON_PATH}")
+
+    # Seed 54 cows on boot
+    if len(herd_store) == 0 and model is not None:
+        print("[*] Pre-populating 54 cows into memory store...")
+        for i in range(1, 55):
+            cow_id = f"COW_{i:03d}"
+            is_sample_risk = (i in [7, 14, 29])
+            is_sample_watch = (i in [3, 19, 42])
+
+            temp = 39.6 if is_sample_risk else (39.1 if is_sample_watch else 38.5)
+            hardness = 2.5 if is_sample_risk else (1.0 if is_sample_watch else 0.0)
+            pain = 2.0 if is_sample_risk else 0.0
+            visibility = 1.0 if is_sample_risk else 0.0
+
+            telemetry_data = TelemetryPayload(
+                cow_id=cow_id,
+                Months_after_giving_birth=2.0 + (i % 6),
+                Previous_Mastits_status=1.0 if (i % 5 == 0) else 0.0,
+                IUFL=215.0 + (i % 10),
+                EUFL=245.0 if is_sample_risk else (230.0 + (i % 8)),
+                IUFR=218.0,
+                EUFR=242.0 if is_sample_risk else 231.0,
+                IURL=220.0,
+                EURL=236.0,
+                IURR=222.0,
+                EURR=235.0,
+                Temperature=temp,
+                Hardness=hardness,
+                Pain=pain,
+                Milk_visibility=visibility,
+                Rumination_Time_min=320.0 if is_sample_risk else (480.0 + (i % 50)),
+                Eating_Time_min=240.0 if is_sample_risk else 370.0,
+                Lying_Time_hr=13.5 if is_sample_risk else 11.5,
+                Steps_Per_Day=1400.0 if is_sample_risk else 3200.0,
+                SCC_K_cells_per_mL=450.0 if is_sample_risk else 80.0,
+                Milk_Conductivity_mS=6.8 if is_sample_risk else 4.5,
+                Milk_Yield_L=12.0 if is_sample_risk else 22.0
+            )
+            ingest_telemetry_internal(telemetry_data)
+        print(f"[+] Successfully seeded {len(herd_store)} cows.")
+
+@app.get("/")
+def root():
+    return {
+        "system": "MastiGuard AI (Aarogya) Sentinel Platform",
+        "status": "online",
+        "active_cattle_count": len(herd_store),
+        "model_loaded": model is not None,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.post("/api/v1/telemetry")
+def ingest_telemetry(payload: TelemetryPayload):
+    return ingest_telemetry_internal(payload)
 
 @app.get("/api/v1/cows")
 def get_all_cows():
