@@ -19,7 +19,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_JSON_PATH = os.path.join(BASE_DIR, "models", "xgboost_mastitis_model.json")
 META_JSON_PATH = os.path.join(BASE_DIR, "models", "model_meta.json")
 
-# Default registered phone for auto-alerts
+# Default registered phone for automated mastitis alerts
 DEFAULT_FARMER_PHONE = os.getenv("FARMER_PHONE_NUMBER", "+919080665253")
 
 # Model and explainer singletons
@@ -187,15 +187,9 @@ def trigger_outbound_sms(cow_id: str, phone: str, custom_message: str) -> Dict[s
             from twilio.rest import Client
             client = Client(account_sid, auth_token)
             
-            # Twilio trial sandbox format matching Appointment Reminder template
-            twilio_payload_body = (
-                f"Your appointment reminder for Aarogya Sentinel Health: "
-                f"ALERT {cow_id} detected with acute mastitis risk. "
-                f"Immediate quarantine required."
-            )
-            
+            # Exact template ID required by Twilio Trial accounts
             message = client.messages.create(
-                body=twilio_payload_body,
+                body="sms_appointment_reminders",
                 from_=from_number,
                 to=phone
             )
@@ -384,7 +378,7 @@ def ingest_telemetry(payload: TelemetryPayload):
     if risk_level == "Mastitis Risk" and not prev_state.get("user_unquarantined", False):
         is_quarantined = True
 
-    # Automated SMS trigger on mastitis threshold
+    # Automated Clinical Alert Trigger
     if risk_level == "Mastitis Risk":
         alert_msg = (
             f"ALERT: {payload.cow_id} detected with acute mastitis risk "
