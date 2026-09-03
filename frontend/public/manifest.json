@@ -1,21 +1,26 @@
 {
+  "id": "/",
   "name": "MastiGuard AI - Aarogya Sentinel",
   "short_name": "MastiGuard",
   "description": "Bovine Mastitis & Cattle Health Predictive Sentinel Platform",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
+  "orientation": "portrait-primary",
   "background_color": "#F8FAFC",
   "theme_color": "#00361A",
   "icons": [
     {
-      "src": "/icon-192.svg",
+      "src": "/icon-192.png",
       "sizes": "192x192",
-      "type": "image/svg+xml"
+      "type": "image/png",
+      "purpose": "any maskable"
     },
     {
-      "src": "/icon-512.svg",
+      "src": "/icon-512.png",
       "sizes": "512x512",
-      "type": "image/svg+xml"
+      "type": "image/png",
+      "purpose": "any maskable"
     }
   ]
 }
