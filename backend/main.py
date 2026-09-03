@@ -19,6 +19,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_JSON_PATH = os.path.join(BASE_DIR, "models", "xgboost_mastitis_model.json")
 META_JSON_PATH = os.path.join(BASE_DIR, "models", "model_meta.json")
 
+# Default registered phone for auto-alerts
+DEFAULT_FARMER_PHONE = os.getenv("FARMER_PHONE_NUMBER", "+919080665253")
+
 # Model and explainer singletons
 model: Optional[XGBClassifier] = None
 explainer: Optional[shap.TreeExplainer] = None
@@ -167,6 +170,53 @@ def compute_derived_features(raw: Dict[str, float]) -> Dict[str, float]:
         "Activity_Drop_Index": float(activity_drop),
         "SCC_Log10": float(scc_log),
     }
+
+def trigger_outbound_sms(cow_id: str, phone: str, custom_message: str) -> Dict[str, Any]:
+    msg_id = f"MSG_{uuid.uuid4().hex[:10].upper()}"
+    ts = datetime.now(timezone.utc).isoformat()
+    
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_PHONE_NUMBER")
+    
+    delivered_via = "GSM_AT_SIMULATOR"
+    raw_serial_command = f'AT+CMGS="{phone}"\r\n{custom_message}\x1A'
+
+    if account_sid and auth_token and from_number:
+        try:
+            from twilio.rest import Client
+            client = Client(account_sid, auth_token)
+            
+            # Twilio trial sandbox format matching Appointment Reminder template
+            twilio_payload_body = (
+                f"Your appointment reminder for Aarogya Sentinel Health: "
+                f"ALERT {cow_id} detected with acute mastitis risk. "
+                f"Immediate quarantine required."
+            )
+            
+            message = client.messages.create(
+                body=twilio_payload_body,
+                from_=from_number,
+                to=phone
+            )
+            msg_id = message.sid
+            delivered_via = "TWILIO_GATEWAY"
+            print(f"[+] Twilio auto-alert dispatched successfully: {msg_id}")
+        except Exception as e:
+            print(f"[!] Twilio dispatch failed ({e}); defaulting to Edge GSM AT Simulator")
+
+    log_entry = {
+        "message_id": msg_id,
+        "cow_id": cow_id,
+        "recipient_phone": phone,
+        "message": custom_message,
+        "status": "delivered",
+        "method": delivered_via,
+        "raw_at_command": raw_serial_command,
+        "timestamp": ts
+    }
+    sms_history.insert(0, log_entry)
+    return log_entry
 
 def seed_initial_herd():
     print("[*] Pre-populating 54 cows into memory store...")
@@ -334,6 +384,18 @@ def ingest_telemetry(payload: TelemetryPayload):
     if risk_level == "Mastitis Risk" and not prev_state.get("user_unquarantined", False):
         is_quarantined = True
 
+    # Automated SMS trigger on mastitis threshold
+    if risk_level == "Mastitis Risk":
+        alert_msg = (
+            f"ALERT: {payload.cow_id} detected with acute mastitis risk "
+            f"({round(prob_mastitis * 100, 1)}%). Quarantined."
+        )
+        trigger_outbound_sms(
+            cow_id=payload.cow_id,
+            phone=DEFAULT_FARMER_PHONE,
+            custom_message=alert_msg
+        )
+
     cow_record = {
         "cow_id": payload.cow_id,
         "timestamp": ts,
@@ -370,43 +432,11 @@ def toggle_quarantine(cow_id: str, req: QuarantineToggleRequest):
 
 @app.post("/api/v1/sms/dispatch")
 def dispatch_sms(req: SmsDispatchRequest):
-    msg_id = f"MSG_{uuid.uuid4().hex[:10].upper()}"
-    ts = datetime.now(timezone.utc).isoformat()
-    
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    from_number = os.getenv("TWILIO_PHONE_NUMBER")
-    
-    delivered_via = "GSM_AT_SIMULATOR"
-    raw_serial_command = f'AT+CMGS="{req.recipient_phone}"\r\n{req.message}\x1A'
-
-    if account_sid and auth_token and from_number:
-        try:
-            from twilio.rest import Client
-            client = Client(account_sid, auth_token)
-            message = client.messages.create(
-                body=req.message,
-                from_=from_number,
-                to=req.recipient_phone
-            )
-            msg_id = message.sid
-            delivered_via = "TWILIO_GATEWAY"
-        except Exception as e:
-            print(f"[!] Twilio dispatch failed ({e}); defaulting to Edge GSM AT Simulator")
-
-    log_entry = {
-        "message_id": msg_id,
-        "cow_id": req.cow_id,
-        "recipient_phone": req.recipient_phone,
-        "message": req.message,
-        "status": "delivered",
-        "method": delivered_via,
-        "raw_at_command": raw_serial_command,
-        "timestamp": ts
-    }
-    sms_history.insert(0, log_entry)
-
-    return log_entry
+    return trigger_outbound_sms(
+        cow_id=req.cow_id,
+        phone=req.recipient_phone,
+        custom_message=req.message
+    )
 
 @app.get("/api/v1/sms/history")
 def get_sms_history():
